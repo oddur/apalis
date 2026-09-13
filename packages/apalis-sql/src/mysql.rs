@@ -682,8 +682,8 @@ impl<J: 'static + Serialize + DeserializeOwned + Unpin + Send + Sync> BackendExp
 
     async fn list_workers(&self) -> Result<Vec<Worker<WorkerState>>, Self::Error> {
         let fetch_query =
-            "SELECT id, layers, last_seen FROM workers WHERE worker_type = ? ORDER BY last_seen DESC LIMIT 20 OFFSET ?";
-        let res: Vec<(String, String, i64)> = sqlx::query_as(fetch_query)
+            "SELECT id, layers FROM workers WHERE worker_type = ? ORDER BY last_seen DESC LIMIT 20 OFFSET ?";
+        let res: Vec<(String, String)> = sqlx::query_as(fetch_query)
             .bind(self.get_config().namespace())
             .bind(0)
             .fetch_all(self.pool())
@@ -710,7 +710,20 @@ mod tests {
     use apalis_core::test_utils::apalis_test_service_fn;
     use apalis_core::test_utils::TestWrapper;
 
-    generic_storage_test!(setup);
+    generic_storage_test!(setup, expire_crashed_worker);
+
+    async fn expire_crashed_worker(storage: &mut MysqlStorage<u32>) {
+        // The crashed worker and its replacement can start in the same
+        // DATETIME second. Explicitly expire the lease so recovery does
+        // not depend on timestamp rounding or the test runner's speed.
+        let result = sqlx::query(
+            "UPDATE workers SET last_seen = NOW() - INTERVAL 6 MINUTE WHERE id = 'test-worker'",
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+    }
 
     sql_storage_tests!(setup::<Email>, MysqlStorage<Email>, Email);
 
@@ -789,6 +802,14 @@ mod tests {
         let now = Utc::now();
 
         register_worker_at(storage, now).await
+    }
+
+    #[tokio::test]
+    async fn list_workers_decodes_a_registered_worker() {
+        let mut storage = setup::<Email>().await;
+        let worker = register_worker(&mut storage).await;
+        let workers = storage.list_workers().await.unwrap();
+        assert!(workers.iter().any(|listed| listed.id() == worker.id()));
     }
 
     async fn push_email(storage: &mut MysqlStorage<Email>, email: Email) {

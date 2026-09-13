@@ -6,6 +6,8 @@
   and compare timezone-aware timestamps.
 - PostgreSQL acknowledgments carry the request owner and claim generation;
   rejected completions emit `PgPollError::AckRejected` with their task IDs.
+- MySQL worker listing no longer decodes a DATETIME as an integer. Crash-recovery
+  tests explicitly expire the dead worker's lease instead of depending on clock rounding.
 - Apply all bundled migrations before deploying any PostgreSQL reader/worker.
   Each worker process/incarnation must have a unique WorkerId. Administrative
   update/reschedule/kill remain explicit overrides of running jobs.

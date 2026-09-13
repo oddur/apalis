@@ -3,8 +3,9 @@ on:
     paths:
       - "packages/apalis-sql/src/lib.rs"
       - "packages/apalis-sql/src/mysql.rs"
-      - "packages/apalis-sql/src/migrations/mysql/**"
-      - "packages/apalis-sql/src/Cargo.toml"
+      - "packages/apalis-sql/migrations/mysql/**"
+      - "packages/apalis-sql/Cargo.toml"
+      - "Cargo.toml"
       - ".github/workflows/mysql.yaml"
       - "packages/apalis-core/**"
 
@@ -16,6 +17,7 @@ jobs:
   test-mysql:
     name: Test Suite with MySQL
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       mysql:
         image: mysql:8
