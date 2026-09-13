@@ -16,7 +16,6 @@ use apalis_core::{backend::Backend, codec::Codec};
 use async_stream::try_stream;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt, TryStreamExt};
-use log::error;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use sqlx::mysql::MySqlRow;
@@ -170,7 +169,8 @@ where
                     let task_ids: Vec<String> = task_ids.iter().map(|r| r.get_unchecked("id")).collect();
                     let id_params = format!("?{}", ", ?".repeat(task_ids.len() - 1));
                     let query = format!("UPDATE jobs SET status = 'Running', lock_by = ?, lock_at = NOW() WHERE id IN({}) AND status = 'Pending' AND lock_by IS NULL;", id_params);
-                    let mut query = sqlx::query(&query).bind(worker_id.clone());
+                    // Only placeholder counts are interpolated; all job IDs stay bound.
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(query)).bind(worker_id.clone());
                     for i in &task_ids {
                         query = query.bind(i);
                     }
@@ -178,7 +178,7 @@ where
                     tx.commit().await?;
 
                     let fetch_query = format!("SELECT * FROM jobs WHERE ID IN ({}) ORDER BY priority DESC, run_at ASC", id_params);
-                    let mut query = sqlx::query_as(&fetch_query);
+                    let mut query = sqlx::query_as(sqlx::AssertSqlSafe(fetch_query));
                     for i in task_ids {
                         query = query.bind(i);
                     }

@@ -24,6 +24,6 @@ default-features = false
 version = "0.1"
 
 [dependencies.sqlx]
-version = "0.8.1"
+version = "0.9"
 default-features = false
 features = ["sqlite"]
