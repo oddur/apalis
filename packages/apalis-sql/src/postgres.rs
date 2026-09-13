@@ -1241,6 +1241,7 @@ mod tests {
                     .context
                     .status()
                     == State::Done
+                    && *rejected.lock().unwrap() == vec![id.to_string()]
                 {
                     break;
                 }
