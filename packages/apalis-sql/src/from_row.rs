@@ -113,6 +113,7 @@ impl<'r, T: Decode<'r, sqlx::Postgres> + Type<sqlx::Postgres>>
         let attempt: i32 = row.try_get("attempts").unwrap_or(0);
         parts.attempt = Attempt::new_with_value(attempt as usize);
         let mut context = SqlContext::new();
+        context.set_claim_generation(row.try_get("claim_generation")?);
 
         let run_at = row.try_get("run_at")?;
         context.set_run_at(run_at);

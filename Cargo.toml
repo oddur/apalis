@@ -90,7 +90,7 @@ redis = { version = "0.32", default-features = false, features = [
 ] }
 
 [dev-dependencies.sqlx]
-version = "0.8.1"
+version = "0.9"
 default-features = false
 features = ["chrono", "mysql", "sqlite", "postgres", "runtime-tokio"]
 

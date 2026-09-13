@@ -402,9 +402,10 @@ pub mod test_utils {
         };
     }
     #[macro_export]
-    /// Tests a generic storage
+    /// Tests a generic storage. Lease-based backends may supply an optional
+    /// async hook to expire a crashed worker before testing restart recovery.
     macro_rules! generic_storage_test {
-        ($setup:path ) => {
+        ($setup:path $(, $expire_crashed_worker:path)? ) => {
             #[tokio::test]
             async fn integration_test_storage_push_and_consume() {
                 let backend = $setup().await;
@@ -585,6 +586,9 @@ pub mod test_utils {
 
                 let res = t.len().await.unwrap();
                 assert_eq!(res, 0, "Job should not have been re-added to the queue");
+
+                // Model expiry of a dead worker lease before restarting it.
+                $( $expire_crashed_worker(&mut t.backend).await; )?
 
                 // We start a healthy worker
                 let service = apalis_test_service_fn(|request: Request<u32, _>| async move {

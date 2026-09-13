@@ -1,3 +1,17 @@
+# BT SQLx 0.9 fork (based on v0.7.4)
+
+- SQLx 0.9 across SQL backends; `tokio-runtime` lets consumers choose TLS.
+- `push_request_on` and `schedule_request_on` atomically enqueue with application data.
+- PostgreSQL startup respects heartbeat expiry; orphan sweeps lock candidates
+  and compare timezone-aware timestamps.
+- PostgreSQL acknowledgments carry the request owner and claim generation;
+  rejected completions emit `PgPollError::AckRejected` with their task IDs.
+- MySQL worker listing no longer decodes a DATETIME as an integer. Crash-recovery
+  tests explicitly expire the dead worker's lease instead of depending on clock rounding.
+- Apply all bundled migrations before deploying any PostgreSQL reader/worker.
+  Each worker process/incarnation must have a unique WorkerId. Administrative
+  update/reschedule/kill remain explicit overrides of running jobs.
+
 # Changelog
 
 All notable changes to this project are documented in this file.

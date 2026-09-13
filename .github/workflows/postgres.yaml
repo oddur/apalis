@@ -1,10 +1,8 @@
 on:
   pull_request:
     paths:
-      - "packages/apalis-sql/src/lib.rs"
-      - "packages/apalis-sql/src/postgres.rs"
-      - "packages/apalis-sql/src/migrations/postgres/**"
-      - "packages/apalis-sql/src/Cargo.toml"
+      - "Cargo.toml"
+      - "packages/apalis-sql/**"
       - ".github/workflows/postgres.yaml"
       - "packages/apalis-core/**"
 
@@ -13,9 +11,10 @@ permissions:
   contents: read
 
 jobs:
-  test-sqlite:
+  test-postgres:
     name: Test Suite Postgres
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17
@@ -32,5 +31,7 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
-      - run: cargo test --no-default-features --features postgres,migrate,tokio-comp -- --test-threads=1
+      - run: cargo check --all-features
+        working-directory: packages/apalis-sql
+      - run: cargo test --no-default-features --features postgres,migrate,tokio-runtime -- --test-threads=1
         working-directory: packages/apalis-sql

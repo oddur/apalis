@@ -15,7 +15,7 @@
 //!      std::env::set_var("RUST_LOG", "debug,sqlx::query=error");
 //!      let database_url = std::env::var("DATABASE_URL").expect("Must specify url to db");
 //!      let pool = PgPool::connect(&database_url).await.unwrap();
-//!      
+//!
 //!      PostgresStorage::setup(&pool).await.unwrap();
 //!      let pg: PostgresStorage<Email> = PostgresStorage::new(pool);
 //!
@@ -59,7 +59,6 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use futures::{select, stream, SinkExt};
-use log::error;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use sqlx::postgres::PgListener;
@@ -79,6 +78,13 @@ use crate::from_row::SqlRequest;
 
 /// Represents a [Storage] that persists to Postgres
 // #[derive(Debug)]
+/// Each live worker and each restarted worker must use a distinct `WorkerId`.
+/// IDs identify heartbeat leases, not stable queue names. Reusing an ID can
+/// keep an abandoned job alive indefinitely or invalidate acknowledgment fencing.
+/// Apply all bundled migrations before starting any reader, including
+/// `fetch_by_id`: `claim_generation` is a required PostgreSQL column.
+/// Administrative `update`, `reschedule`, and `kill` intentionally override
+/// in-flight execution; acknowledgment fencing does not restrict those actions.
 pub struct PostgresStorage<T, C = JsonCodec<serde_json::Value>>
 where
     C: Codec,
@@ -126,6 +132,10 @@ pub enum PgPollError {
     #[error("Encountered an error during ACK: `{0}`")]
     AckError(sqlx::Error),
 
+    /// Acknowledgments rejected because their claim no longer owns the job.
+    #[error("Rejected acknowledgments for expired or invalid claims: {0:?}")]
+    AckRejected(Vec<String>),
+
     /// Error while fetching the next item.
     #[error("Encountered an error during FetchNext: `{0}`")]
     FetchNextError(apalis_core::error::Error),
@@ -169,9 +179,13 @@ where
         let pool = self.pool.clone();
         let worker = worker.clone();
         let heartbeat = async move {
-            // Lets reenqueue any jobs that belonged to this worker in case of a death
+            // Startup must obey the same stale-heartbeat threshold as the
+            // periodic sweep; a new replica must not reclaim healthy work.
+            let dead_since = Utc::now()
+                - chrono::Duration::from_std(config.reenqueue_orphaned_after)
+                    .expect("could not build dead_since");
             if let Err(e) = self
-                .reenqueue_orphaned((config.buffer_size * 10) as i32, Utc::now())
+                .reenqueue_orphaned((config.buffer_size * 10) as i32, dead_since)
                 .await
             {
                 worker.emit(Event::Error(Box::new(PgPollError::ReenqueueOrphanedError(
@@ -228,35 +242,42 @@ where
                     ids = ack_stream.next() => {
 
                         if let Some(ids) = ids {
-                            let ack_ids: Vec<(String, String, String, String, u64)> = ids.iter().map(|(ctx, res)| {
-                                (res.task_id.to_string(), worker.id().to_string(), serde_json::to_string(&res.inner.as_ref().map_err(|e| e.to_string())).expect("Could not convert response to json"), calculate_status(ctx,res).to_string(), res.attempt.current() as u64)
+                            let ack_ids: Vec<(String, Option<String>, String, String, u64, i64)> = ids.iter().map(|(ctx, res)| {
+                                (res.task_id.to_string(), ctx.lock_by().as_ref().map(ToString::to_string), serde_json::to_string(&res.inner.as_ref().map_err(|e| e.to_string())).expect("Could not convert response to json"), calculate_status(ctx,res).to_string(), res.attempt.current() as u64, ctx.claim_generation())
                             }).collect();
                             let query =
                                 "UPDATE apalis.jobs
-                                    SET status = Q.status, 
-                                        done_at = now(), 
-                                        lock_by = Q.worker_id, 
-                                        last_error = Q.result, 
-                                        attempts = Q.attempts 
+                                    SET status = Q.status,
+                                        done_at = now(),
+                                        lock_by = Q.worker_id,
+                                        last_error = Q.result,
+                                        attempts = Q.attempts
                                     FROM (
-                                        SELECT (value->>0)::text as id, 
-                                            (value->>1)::text as worker_id, 
-                                            (value->>2)::text as result, 
-                                            (value->>3)::text as status, 
-                                            (value->>4)::int as attempts 
+                                        SELECT (value->>0)::text as id,
+                                            (value->>1)::text as worker_id,
+                                            (value->>2)::text as result,
+                                            (value->>3)::text as status,
+                                            (value->>4)::int as attempts,
+                                            (value->>5)::bigint as claim_generation
                                         FROM json_array_elements($1::json)
                                     ) Q
-                                    WHERE apalis.jobs.id = Q.id;
+                                    WHERE apalis.jobs.id = Q.id
+                                      AND apalis.jobs.lock_by = Q.worker_id
+                                      AND apalis.jobs.claim_generation = Q.claim_generation
+                                      AND apalis.jobs.status = 'Running'
+                                    RETURNING apalis.jobs.id, apalis.jobs.claim_generation, apalis.jobs.lock_by;
                                     ";
                             let codec_res = C::encode(&ack_ids);
                             match codec_res {
                                 Ok(val) => {
-                                    if let Err(e) = sqlx::query(query)
-                                        .bind(val)
-                                        .execute(&pool)
-                                        .await
-                                    {
-                                        worker.emit(Event::Error(Box::new(PgPollError::AckError(e))));
+                                    match sqlx::query_as::<_, (String, i64, Option<String>)>(query).bind(val).fetch_all(&pool).await {
+                                        Ok(accepted) => {
+                                            let rejected: Vec<_> = ack_ids.iter().filter(|a| !accepted.iter().any(|(id, generation, owner)| id == &a.0 && generation == &a.5 && owner == &a.1)).map(|a| a.0.clone()).collect();
+                                            if !rejected.is_empty() {
+                                                worker.emit(Event::Error(Box::new(PgPollError::AckRejected(rejected))));
+                                            }
+                                        }
+                                        Err(e) => { worker.emit(Event::Error(Box::new(PgPollError::AckError(e)))); }
                                     }
                                 }
                                 Err(e) => {
@@ -468,6 +489,70 @@ where
     }
 }
 
+impl<Req, C> PostgresStorage<Req, C>
+where
+    Req: Serialize + DeserializeOwned + Send + 'static + Unpin + Sync,
+    C: Codec<Compact = Value> + Send + 'static,
+    C::Error: Send + std::error::Error + Sync + 'static,
+{
+    /// Push a request using an existing executor, allowing application data
+    /// and its background job to commit or roll back in one transaction.
+    pub async fn push_request_on<'e, E>(
+        &mut self,
+        executor: E,
+        req: Request<Req, SqlContext>,
+    ) -> Result<Parts<SqlContext>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        self.insert_request_on(executor, req, None).await
+    }
+
+    /// Schedule a request in the caller's transaction, like `push_request_on`.
+    pub async fn schedule_request_on<'e, E>(
+        &mut self,
+        executor: E,
+        req: Request<Req, SqlContext>,
+        on: Timestamp,
+    ) -> Result<Parts<SqlContext>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let on = DateTime::from_timestamp(on, 0).ok_or_else(|| {
+            sqlx::Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid scheduled timestamp",
+            ))
+        })?;
+        self.insert_request_on(executor, req, Some(on)).await
+    }
+
+    async fn insert_request_on<'e, E>(
+        &mut self,
+        executor: E,
+        req: Request<Req, SqlContext>,
+        on: Option<DateTime<Utc>>,
+    ) -> Result<Parts<SqlContext>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let query = "INSERT INTO apalis.jobs (job, id, job_type, max_attempts, run_at, priority)
+            VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), $6)";
+        let args = C::encode(&req.args)
+            .map_err(|e| sqlx::Error::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        sqlx::query(query)
+            .bind(args)
+            .bind(req.parts.task_id.to_string())
+            .bind(&self.config.namespace)
+            .bind(req.parts.context.max_attempts())
+            .bind(on)
+            .bind(req.parts.context.priority())
+            .execute(executor)
+            .await?;
+        Ok(req.parts)
+    }
+}
+
 impl<Req, C> Storage for PostgresStorage<Req, C>
 where
     Req: Serialize + DeserializeOwned + Send + 'static + Unpin + Sync,
@@ -493,20 +578,8 @@ where
         &mut self,
         req: Request<Self::Job, SqlContext>,
     ) -> Result<Parts<SqlContext>, sqlx::Error> {
-        let query = "INSERT INTO apalis.jobs VALUES ($1, $2, $3, 'Pending', 0, $4, NOW() , NULL, NULL, NULL, NULL, $5)";
-
-        let args = C::encode(&req.args)
-            .map_err(|e| sqlx::Error::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        let job_type = self.config.namespace.clone();
-        sqlx::query(query)
-            .bind(args)
-            .bind(req.parts.task_id.to_string())
-            .bind(&job_type)
-            .bind(req.parts.context.max_attempts())
-            .bind(req.parts.context.priority())
-            .execute(&self.pool)
-            .await?;
-        Ok(req.parts)
+        let pool = self.pool.clone();
+        self.push_request_on(&pool, req).await
     }
 
     async fn push_raw_request(
@@ -534,24 +607,8 @@ where
         req: Request<Self::Job, SqlContext>,
         on: Timestamp,
     ) -> Result<Parts<Self::Context>, sqlx::Error> {
-        let query =
-            "INSERT INTO apalis.jobs VALUES ($1, $2, $3, 'Pending', 0, $4, $5, NULL, NULL, NULL, NULL, $6)";
-        let task_id = req.parts.task_id.to_string();
-        let parts = req.parts;
-        let on = DateTime::from_timestamp(on, 0);
-        let job = C::encode(&req.args)
-            .map_err(|e| sqlx::Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-        let job_type = self.config.namespace.clone();
-        sqlx::query(query)
-            .bind(job)
-            .bind(task_id)
-            .bind(job_type)
-            .bind(parts.context.max_attempts())
-            .bind(on)
-            .bind(parts.context.priority())
-            .execute(&self.pool)
-            .await?;
-        Ok(parts)
+        let pool = self.pool.clone();
+        self.schedule_request_on(&pool, req, on).await
     }
 
     async fn fetch_by_id(
@@ -671,7 +728,8 @@ where
 }
 
 impl<T, C: Codec> PostgresStorage<T, C> {
-    /// Kill a job
+    /// Administrative cancellation of the current job owned by `worker_id`.
+    /// This deliberately overrides an in-flight execution, whose ack is rejected.
     pub async fn kill(
         &mut self,
         worker_id: &WorkerId,
@@ -714,15 +772,16 @@ impl<T, C: Codec> PostgresStorage<T, C> {
     ) -> Result<(), sqlx::Error> {
         let job_type = self.config.namespace.clone();
         let mut tx = self.pool.acquire().await?;
-        let query = "UPDATE apalis.jobs
-                            SET status = 'Pending', done_at = NULL, lock_by = NULL, lock_at = NULL, last_error = 'Job was abandoned'
-                            WHERE id IN
-                                (SELECT jobs.id FROM apalis.jobs INNER JOIN apalis.workers ON lock_by = workers.id
-                                    WHERE status = 'Running' 
-                                    AND workers.last_seen < ($3::timestamp)
-                                    AND workers.worker_type = $1 
-                                    ORDER BY lock_at ASC 
-                                    LIMIT $2);";
+        let query = "WITH abandoned AS (
+            SELECT jobs.id FROM apalis.jobs jobs JOIN apalis.workers workers ON jobs.lock_by = workers.id
+            WHERE jobs.status = 'Running' AND workers.last_seen < $3
+              AND jobs.job_type = $1
+            ORDER BY jobs.lock_at ASC LIMIT $2
+            FOR UPDATE OF jobs SKIP LOCKED
+        )
+        UPDATE apalis.jobs SET status = 'Pending', done_at = NULL, lock_by = NULL,
+            lock_at = NULL, last_error = 'Job was abandoned'
+        WHERE id IN (SELECT id FROM abandoned)";
 
         sqlx::query(query)
             .bind(job_type)
@@ -815,7 +874,12 @@ mod tests {
     use apalis_core::test_utils::apalis_test_service_fn;
     use apalis_core::test_utils::TestWrapper;
 
-    generic_storage_test!(setup);
+    generic_storage_test!(setup, expire_crashed_worker);
+
+    async fn expire_crashed_worker(storage: &mut PostgresStorage<u32>) {
+        sqlx::query("UPDATE apalis.workers SET last_seen = now() - INTERVAL '6 minutes' WHERE id = 'test-worker'")
+            .execute(storage.pool()).await.unwrap();
+    }
 
     sql_storage_tests!(setup::<Email>, PostgresStorage<Email>, Email);
 
@@ -912,6 +976,367 @@ mod tests {
             .await
             .expect("failed to fetch job by id")
             .expect("no job found by id")
+    }
+
+    #[tokio::test]
+    async fn transactional_enqueue_commits_and_rolls_back_with_application_data() {
+        let mut storage = setup::<Email>().await;
+        let pool = storage.pool.clone();
+        sqlx::query("CREATE TABLE IF NOT EXISTS public.enqueue_test (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for commit in [false, true] {
+            let mut tx = pool.begin().await.unwrap();
+            let parts = storage
+                .push_request_on(&mut *tx, Request::new(example_email()))
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO public.enqueue_test (id) VALUES ($1)")
+                .bind(parts.task_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert!(storage.fetch_by_id(&parts.task_id).await.unwrap().is_none());
+            if commit {
+                tx.commit().await.unwrap();
+            } else {
+                tx.rollback().await.unwrap();
+            }
+            assert_eq!(
+                storage.fetch_by_id(&parts.task_id).await.unwrap().is_some(),
+                commit
+            );
+            let present: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM public.enqueue_test WHERE id = $1)",
+            )
+            .bind(parts.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(present, commit);
+        }
+        sqlx::query("DROP TABLE public.enqueue_test")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transactional_schedule_is_invisible_until_commit_and_not_claimed_early() {
+        let mut storage = setup::<Email>().await;
+        let owner = register_worker(&mut storage).await;
+        let pool = storage.pool.clone();
+        let on = Utc::now().timestamp() + 300;
+        for commit in [false, true] {
+            let mut tx = pool.begin().await.unwrap();
+            let parts = storage
+                .schedule_request_on(&mut *tx, Request::new(example_email()), on)
+                .await
+                .unwrap();
+            assert!(storage.fetch_by_id(&parts.task_id).await.unwrap().is_none());
+            if commit {
+                tx.commit().await.unwrap();
+            } else {
+                tx.rollback().await.unwrap();
+            }
+            let job = storage.fetch_by_id(&parts.task_id).await.unwrap();
+            assert_eq!(job.is_some(), commit);
+            if let Some(job) = job {
+                assert_eq!(job.parts.context.run_at().timestamp(), on);
+            }
+            assert!(storage.fetch_next(owner.id()).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_another_poller_preserves_a_healthy_workers_job() {
+        let mut storage = setup::<Email>().await;
+        storage.config = storage
+            .config
+            .clone()
+            .set_keep_alive(Duration::from_millis(10));
+        let owner = register_worker(&mut storage).await;
+        let id = push_email(&mut storage, example_email()).await;
+        consume_one(&mut storage, owner.id()).await;
+        let new_id = WorkerId::new("second-live-worker");
+        let worker = Worker::new(new_id.clone(), Context::default());
+        worker.start();
+        let poller = storage.clone().poll(&worker);
+        let heartbeat = tokio::spawn(poller.heartbeat);
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let registered: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apalis.workers WHERE id = $1)")
+                        .bind(new_id.name())
+                        .fetch_one(&storage.pool)
+                        .await
+                        .unwrap();
+                if registered {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            storage.fetch_by_id(&id).await.unwrap().unwrap()
+        })
+        .await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        let job = result.expect("new poller heartbeat must run");
+        assert_eq!(*job.parts.context.status(), State::Running);
+        assert_eq!(job.parts.context.lock_by().as_ref(), Some(owner.id()));
+        cleanup(&mut storage, &new_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_incarnation_recovers_the_expired_previous_incarnations_job() {
+        let mut storage = setup::<Email>().await;
+        storage.config = storage
+            .config
+            .clone()
+            .set_poll_interval(Duration::from_millis(10));
+        let old_owner = register_worker(&mut storage).await;
+        let id = push_email(&mut storage, example_email()).await;
+        consume_one(&mut storage, old_owner.id()).await;
+        let new_id = WorkerId::new("test-worker-new-incarnation");
+        let new_owner = Worker::new(new_id.clone(), Context::default());
+        new_owner.start();
+        let poller = storage.clone().poll(&new_owner);
+        let heartbeat = tokio::spawn(poller.heartbeat);
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let registered: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apalis.workers WHERE id = $1)")
+                        .bind(new_id.name())
+                        .fetch_one(storage.pool())
+                        .await
+                        .unwrap();
+                if registered {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The new incarnation must not renew the old incarnation's lease.
+            sqlx::query(
+                "UPDATE apalis.workers SET last_seen = now() - INTERVAL '6 minutes' WHERE id = $1",
+            )
+            .bind(old_owner.id().name())
+            .execute(storage.pool())
+            .await
+            .unwrap();
+            loop {
+                if *storage
+                    .fetch_by_id(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .parts
+                    .context
+                    .status()
+                    == State::Pending
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        recovered.expect("new incarnation must reclaim the expired old lease");
+        assert_eq!(consume_one(&mut storage, &new_id).await.parts.task_id, id);
+        cleanup(&mut storage, &new_id).await;
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_skips_a_locked_job() {
+        let mut storage = setup::<Email>().await;
+        let owner = register_worker_at(
+            &mut storage,
+            (Utc::now() - chrono::Duration::minutes(6)).timestamp(),
+        )
+        .await;
+        let id = push_email(&mut storage, example_email()).await;
+        consume_one(&mut storage, owner.id()).await;
+        let mut tx = storage.pool().begin().await.unwrap();
+        sqlx::query("SELECT id FROM apalis.jobs WHERE id = $1 FOR UPDATE")
+            .bind(id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            storage.reenqueue_orphaned(1, Utc::now() - chrono::Duration::minutes(5)),
+        )
+        .await
+        .expect("sweep must skip locked jobs")
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            *storage
+                .fetch_by_id(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .parts
+                .context
+                .status(),
+            State::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_and_current_ack_in_one_batch_report_only_the_rejected_claim() {
+        let mut storage = setup::<Email>().await;
+        storage.config = storage.config.clone().set_buffer_size(10);
+        let rejected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = rejected.clone();
+        use apalis_core::builder::{WorkerBuilder, WorkerFactoryFn};
+        register_worker(&mut storage).await;
+        let runner = WorkerBuilder::new("test-worker")
+            .backend(storage.clone())
+            .build_fn(|_: Email| async {})
+            .on_event(move |event| {
+                if let Event::Error(error) = event.inner() {
+                    if let Some(PgPollError::AckRejected(ids)) = error.downcast_ref::<PgPollError>()
+                    {
+                        events.lock().unwrap().extend(ids.clone());
+                    }
+                }
+            })
+            .run();
+        let owner = runner.get_handle();
+        owner.start();
+        let id = push_email(&mut storage, example_email()).await;
+        let old = consume_one(&mut storage, owner.id()).await;
+        storage
+            .reenqueue_orphaned(1, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        let current = consume_one(&mut storage, owner.id()).await;
+        storage
+            .ack(
+                &old.parts.context,
+                &Response::success((), id.clone(), old.parts.attempt),
+            )
+            .await
+            .unwrap();
+        storage
+            .ack(
+                &current.parts.context,
+                &Response::success((), id.clone(), current.parts.attempt),
+            )
+            .await
+            .unwrap();
+        let poller = storage.clone().poll(&owner);
+        let heartbeat = tokio::spawn(poller.heartbeat);
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *storage
+                    .fetch_by_id(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .parts
+                    .context
+                    .status()
+                    == State::Done
+                    && *rejected.lock().unwrap() == vec![id.to_string()]
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        completed.expect("current acknowledgment must complete");
+        assert_eq!(*rejected.lock().unwrap(), vec![id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stale_ack_cannot_complete_a_reclaimed_job() {
+        assert_stale_ack_is_rejected(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_ack_cannot_complete_a_new_claim_by_the_same_worker() {
+        assert_stale_ack_is_rejected(true).await;
+    }
+
+    async fn assert_stale_ack_is_rejected(reuse_owner: bool) {
+        let mut storage = setup::<Email>().await;
+        let owner = register_worker(&mut storage).await;
+        let id = push_email(&mut storage, example_email()).await;
+        let original = consume_one(&mut storage, owner.id()).await;
+        let new_id = if reuse_owner {
+            owner.id().clone()
+        } else {
+            WorkerId::new("takeover-worker")
+        };
+        storage
+            .keep_alive_at::<DummyService>(&new_id, Utc::now().timestamp())
+            .await
+            .unwrap();
+        storage
+            .reenqueue_orphaned(1, Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        let reclaimed = consume_one(&mut storage, &new_id).await;
+        assert_eq!(reclaimed.parts.task_id, id);
+        assert_eq!(
+            reclaimed.parts.context.claim_generation(),
+            original.parts.context.claim_generation() + 1
+        );
+
+        // A second acknowledgment serves as a barrier: both must pass through
+        // the original poller's actual batched acknowledgment loop.
+        let barrier_id = push_email(&mut storage, example_email()).await;
+        let barrier = consume_one(&mut storage, owner.id()).await;
+        let new_owner = Worker::new(new_id.clone(), Context::default());
+        new_owner.start();
+        let poller = storage.clone().poll(&new_owner);
+        let heartbeat = tokio::spawn(poller.heartbeat);
+        storage
+            .ack(
+                &original.parts.context,
+                &Response::success((), id.clone(), original.parts.attempt),
+            )
+            .await
+            .unwrap();
+        storage
+            .ack(
+                &barrier.parts.context,
+                &Response::success((), barrier_id.clone(), barrier.parts.attempt),
+            )
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if *storage
+                    .fetch_by_id(&barrier_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .parts
+                    .context
+                    .status()
+                    == State::Done
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        completed.expect("acknowledgments must be processed");
+        let job = storage.fetch_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(*job.parts.context.status(), State::Running);
+        assert_eq!(job.parts.context.lock_by().as_ref(), Some(&new_id));
+        cleanup(&mut storage, &new_id).await;
     }
 
     #[tokio::test]

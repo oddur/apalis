@@ -17,6 +17,8 @@ pub struct SqlContext {
     lock_by: Option<WorkerId>,
     done_at: Option<i64>,
     priority: i32,
+    #[serde(default)]
+    claim_generation: i64,
 }
 
 impl Default for SqlContext {
@@ -37,7 +39,19 @@ impl SqlContext {
             last_error: None,
             lock_by: None,
             priority: 0,
+            claim_generation: 0,
         }
+    }
+
+    /// Monotonically increasing PostgreSQL claim generation, used to reject
+    /// completion from an earlier execution even if the same worker reclaims it.
+    pub fn claim_generation(&self) -> i64 {
+        self.claim_generation
+    }
+
+    /// Set the generation read from the PostgreSQL queue row.
+    pub fn set_claim_generation(&mut self, generation: i64) {
+        self.claim_generation = generation;
     }
 
     /// Set the number of attempts

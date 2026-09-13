@@ -17,7 +17,6 @@ use apalis_core::{backend::Backend, codec::Codec};
 use async_stream::try_stream;
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
-use log::error;
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{Pool, Row, Sqlite};
 use std::any::type_name;

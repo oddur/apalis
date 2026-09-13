@@ -15,13 +15,15 @@ postgres = ["sqlx/postgres", "sqlx/json"]
 sqlite = ["sqlx/sqlite", "sqlx/json"]
 mysql = ["sqlx/mysql", "sqlx/json", "sqlx/bigdecimal"]
 migrate = ["sqlx/migrate", "sqlx/macros"]
-async-std-comp = ["async-std", "sqlx/runtime-async-std-rustls"]
-async-std-comp-native-tls = ["async-std", "sqlx/runtime-async-std-native-tls"]
-tokio-comp = ["tokio", "sqlx/runtime-tokio-rustls"]
-tokio-comp-native-tls = ["tokio", "sqlx/runtime-tokio-native-tls"]
+async-std-comp = ["async-std", "sqlx/runtime-async-std", "sqlx/tls-rustls"]
+async-std-comp-native-tls = ["async-std", "sqlx/runtime-async-std", "sqlx/tls-native-tls"]
+# Runtime-only selection lets consumers choose their SQLx TLS provider.
+tokio-runtime = ["tokio", "sqlx/runtime-tokio"]
+tokio-comp = ["tokio-runtime", "sqlx/tls-rustls"]
+tokio-comp-native-tls = ["tokio-runtime", "sqlx/tls-native-tls"]
 
 [dependencies.sqlx]
-version = "0.8.1"
+version = "0.9"
 default-features = false
 features = ["chrono"]
 
